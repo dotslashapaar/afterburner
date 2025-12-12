@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "afterburner-app",
+    "afterburner-common",
+    "afterburner-ebpf",
+    "xtask",
+]
+
+resolver = "2"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

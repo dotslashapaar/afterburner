@@ -1,0 +1,15 @@
+[package]
+name = "afterburner-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya = { git = "https://github.com/aya-rs/aya", branch = "main" }
+aya-log = { git = "https://github.com/aya-rs/aya", branch = "main" }
+afterburner-common = { path = "../afterburner-common" }
+anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
+env_logger = "0.10"
+libc = "0.2"
+quiche = "0.22"

@@ -1,0 +1,14 @@
+[package]
+name = "afterburner-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = { git = "https://github.com/aya-rs/aya", branch = "main" }
+aya-log-ebpf = { git = "https://github.com/aya-rs/aya", branch = "main" }
+afterburner-common = { path = "../afterburner-common" }
+network-types = "0.0.5"
+
+[[bin]]
+name = "afterburner"
+path = "src/main.rs"
