@@ -28,7 +28,7 @@ pub fn afterburner(ctx: XdpContext) -> u32 {
 #[inline(always)]
 fn try_afterburner(ctx: XdpContext) -> Result<u32, ()> {
     let eth = ptr_at::<EthHdr>(&ctx, 0).ok_or(())?;
-    
+
     match eth.ether_type {
         EtherType::Ipv4 => {}
         _ => return Ok(xdp_action::XDP_PASS),
@@ -59,7 +59,7 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Option<&T> {
         return None;
     }
 
-    unsafe {Some(&*((start + offset) as *const T))}
+    unsafe { Some(&*((start + offset) as *const T)) }
 }
 
 #[cfg(not(test))]
