@@ -7,7 +7,6 @@ use aya::{include_bytes_aligned, Ebpf};
 use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::signal;
 
 #[derive(Parser, Debug)]
@@ -79,41 +78,39 @@ async fn main() -> Result<(), anyhow::Error> {
         term_c.store(true, Ordering::Relaxed);
     });
 
-    let mut total_packets: u64 = 0;
-    let mut last_log = std::time::Instant::now();
+    let mut packet_count = 0;
 
     while !term.load(Ordering::Relaxed) {
-        // match on (address, length)
         match socket.poll_rx() {
             Some((addr, len)) => {
-                total_packets += 1;
+                packet_count += 1;
 
-                // // base_address + packet_offset = packet_data
-                // let packet_ptr = unsafe { socket.umem_ptr.add(addr as usize) };
+                // Pointer Arithmetic
+                let packet_ptr = unsafe { socket.umem_ptr.add(addr as usize) };
+                let raw_data = unsafe { std::slice::from_raw_parts(packet_ptr, len) };
 
-                // let raw_data = unsafe { std::slice::from_raw_parts(packet_ptr, len) };
+                // Skip Headers (Ethernet 14 + IP 20 + UDP 8 = 42 bytes)
+                if len > 42 {
+                    let payload = &raw_data[42..];
 
-                // // Header Parsing (IPv4 + UDP = 42 bytes)
-                // if len > 42 {
-                //     let payload = &raw_data[42..];
+                    // Zero-Copy Parsing
+                    if payload.len() > 0 {
+                        // Byte 0 is Signature Count (assuming standard Compact-u16 < 127)
+                        let num_sigs = payload[0];
 
-                //     if let Ok(msg) = std::str::from_utf8(payload) {
-                //         print!(
-                //             "\rPacket #{}: [Len: {}] Data: {}",
-                //             total_packets,
-                //             len,
-                //             msg.trim()
-                //         );
-                //         use std::io::Write;
-                //         std::io::stdout().flush().unwrap();
-                //     }
-                // }
+                        // Bytes 1..65 are the First Signature (64 bytes)
+                        if payload.len() >= 65 {
+                            let sig_bytes = &payload[1..65];
 
-                if total_packets % 50000 == 0 {
-                    if last_log.elapsed().as_secs() >= 1 {
-                        println!("Speed: {} Packets Per Second", total_packets);
-                        total_packets = 0;
-                        last_log = std::time::Instant::now();
+                            print!("Pkt #{}: [Sigs: {}] First Sig: ", packet_count, num_sigs);
+                            // Print first 8 bytes of signature
+                            for b in sig_bytes.iter().take(8) {
+                                print!("{:02x}", b);
+                            }
+                            println!("...");
+                        } else {
+                            println!("Pkt #{}: Malformed (Too short)", packet_count);
+                        }
                     }
                 }
             }
