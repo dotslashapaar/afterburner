@@ -79,37 +79,48 @@ async fn main() -> Result<(), anyhow::Error> {
         term_c.store(true, Ordering::Relaxed);
     });
 
-    let mut packet_count = 0;
+    let mut total_packets: u64 = 0;
+    let mut last_log = std::time::Instant::now();
 
     while !term.load(Ordering::Relaxed) {
         // match on (address, length)
         match socket.poll_rx() {
             Some((addr, len)) => {
-                packet_count += 1;
+                total_packets += 1;
 
-                // base_address + packet_offset = packet_data
-                let packet_ptr = unsafe { socket.umem_ptr.add(addr as usize) };
+                // // base_address + packet_offset = packet_data
+                // let packet_ptr = unsafe { socket.umem_ptr.add(addr as usize) };
 
-                let raw_data = unsafe { std::slice::from_raw_parts(packet_ptr, len) };
+                // let raw_data = unsafe { std::slice::from_raw_parts(packet_ptr, len) };
 
-                // Header Parsing (IPv4 + UDP = 42 bytes)
-                if len > 42 {
-                    let payload = &raw_data[42..];
+                // // Header Parsing (IPv4 + UDP = 42 bytes)
+                // if len > 42 {
+                //     let payload = &raw_data[42..];
 
-                    if let Ok(msg) = std::str::from_utf8(payload) {
-                        print!(
-                            "\rPacket #{}: [Len: {}] Data: {}",
-                            packet_count,
-                            len,
-                            msg.trim()
-                        );
-                        use std::io::Write;
-                        std::io::stdout().flush().unwrap();
+                //     if let Ok(msg) = std::str::from_utf8(payload) {
+                //         print!(
+                //             "\rPacket #{}: [Len: {}] Data: {}",
+                //             total_packets,
+                //             len,
+                //             msg.trim()
+                //         );
+                //         use std::io::Write;
+                //         std::io::stdout().flush().unwrap();
+                //     }
+                // }
+
+                if total_packets % 50000 == 0 {
+                    if last_log.elapsed().as_secs() >= 1 {
+                        println!("Speed: {} Packets Per Second", total_packets);
+                        total_packets = 0;
+                        last_log = std::time::Instant::now();
                     }
                 }
             }
             None => {
-                std::thread::sleep(Duration::from_millis(1));
+                // std::thread::sleep(Duration::from_millis(1)); // This reduces CPU usage, but increases latency.
+
+                std::hint::spin_loop(); // This keeps the CPU core at 100% usage, but reduces latency.
             }
         }
     }
