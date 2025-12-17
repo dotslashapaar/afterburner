@@ -82,7 +82,7 @@ Starting Afterburner QUIC on: veth0
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    USERSPACE APPLICATION                     │
+│                    USERSPACE APPLICATION                    │
 │  ┌─────────┐   ┌──────────────┐   ┌─────────┐               │
 │  │ flood.rs│──▶│quic_driver.rs│──▶│ xsk.rs  │               │
 │  │ (TX Gen)│   │(QUIC State)  │   │(AF_XDP) │               │
@@ -151,6 +151,4 @@ To deploy on Solana mainnet:
 3. **Real Transactions**: Replace `MockTransaction` with `solana_sdk::transaction::VersionedTransaction`
 4. **Real Certificates**: Use validator identity keypair for TLS
 
-## License
-
-MIT
+---
