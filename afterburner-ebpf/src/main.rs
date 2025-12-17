@@ -41,7 +41,7 @@ fn try_afterburner(ctx: XdpContext) -> Result<u32, ()> {
 
     let udp = ptr_at::<UdpHdr>(&ctx, EthHdr::LEN + Ipv4Hdr::LEN).ok_or(())?;
 
-    if u16::from_be(udp.dest) == 8003 {
+    if u16::from_be(udp.dest) == 8000 {
         return Ok(XSK.redirect(0, 0).unwrap_or(xdp_action::XDP_PASS));
         // return Ok(xdp_action::XDP_PASS);
     }

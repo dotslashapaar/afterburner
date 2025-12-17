@@ -4,12 +4,23 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-aya = { git = "https://github.com/aya-rs/aya", branch = "main" }
-aya-log = { git = "https://github.com/aya-rs/aya", branch = "main" }
+# Core
+aya = "0.13"
+aya-log = "0.2"
 afterburner-common = { path = "../afterburner-common" }
-anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
-tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
+anyhow = "1.0"
 env_logger = "0.10"
 libc = "0.2"
+tokio = { version = "1.28", features = ["full"] }
+signal-hook = "0.3"
+
+# QUIC Stack 
 quiche = "0.22"
+ring = "0.17"
+
+# Test Server Tools
+quinn = "0.11" 
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] } 
+rcgen = "0.13" 
+rustls-pki-types = "1.7"

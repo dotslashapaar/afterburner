@@ -1,25 +1,29 @@
-use anyhow::{Context, Result};
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc, Layout};
 use std::ffi::CString;
 use std::mem;
 use std::os::fd::RawFd;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, Ordering};
+use anyhow::{anyhow, Result};
+use libc::{
+    mmap, setsockopt, socket, AF_XDP, MAP_FAILED, MAP_POPULATE, MAP_SHARED, PROT_READ,
+    PROT_WRITE, SOCK_RAW, SOL_XDP, XDP_COPY, XDP_MMAP_OFFSETS, XDP_PGOFF_RX_RING,
+    XDP_RX_RING, XDP_TX_RING, XDP_UMEM_COMPLETION_RING, XDP_UMEM_FILL_RING,
+    XDP_UMEM_PGOFF_COMPLETION_RING, XDP_UMEM_PGOFF_FILL_RING, XDP_UMEM_REG,
+};
 
-// Kernel Constants
-const SOL_XDP: i32 = 283;
-// Options for setsockopt
-const XDP_MMAP_OFFSETS: i32 = 1;
-const XDP_RX_RING: i32 = 2;
-const XDP_TX_RING: i32 = 3;
-const XDP_UMEM_REG: i32 = 4;
-const XDP_UMEM_FILL_RING: i32 = 5;
-const XDP_UMEM_COMPLETION_RING: i32 = 6;
+// Constants
+const UMEM_SIZE: usize = 8 * 1024 * 1024;
+const FRAME_SIZE: usize = 4096;
+const NUM_FRAMES: usize = UMEM_SIZE / FRAME_SIZE;
+const RING_SIZE: u32 = 2048;
 
-const XDP_PGOFF_RX_RING: u64 = 0;
-const XDP_UMEM_PGOFF_FILL_RING: u64 = 0x100000000;
-// flag for forcing copy mode
-const XDP_COPY: u16 = 1 << 1;
+#[repr(C)]
+struct XdpDesc {
+    addr: u64,
+    len: u32,
+    options: u32,
+}
 
 #[repr(C)]
 struct XdpUmemReg {
@@ -31,23 +35,24 @@ struct XdpUmemReg {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Default)]
 struct XdpMmapOffsets {
-    rx: RingOffsets,
-    tx: RingOffsets,
-    fr: RingOffsets,
-    cr: RingOffsets,
+    rx: XdpRingOffsets,
+    tx: XdpRingOffsets,
+    fr: XdpRingOffsets,
+    cr: XdpRingOffsets,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
-struct RingOffsets {
+#[derive(Default)]
+struct XdpRingOffsets {
     producer: u64,
     consumer: u64,
     desc: u64,
     flags: u64,
 }
 
+#[allow(dead_code)]
 struct XdpRing {
     producer: *mut AtomicU32,
     consumer: *mut AtomicU32,
@@ -55,284 +60,196 @@ struct XdpRing {
     size: u32,
     ptr: *mut libc::c_void,
     len: usize,
-    cached_cons: u32,
 }
 
 pub struct XdpSocket {
-    pub fd: RawFd,
     pub umem_ptr: *mut u8,
+    pub fd: RawFd,
+    #[allow(dead_code)]
     umem_layout: Layout,
     rx_ring: XdpRing,
+    tx_ring: XdpRing,
     fill_ring: XdpRing,
+    comp_ring: XdpRing,
+    tx_free_frames: Vec<u64>,
+    pending_tx_addr: Option<u64>,
 }
-
-unsafe impl Send for XdpSocket {}
 
 impl XdpSocket {
     pub fn new(iface: &str, queue_id: u32) -> Result<Self> {
         unsafe {
-            // Creates the Raw AF_XDP Socket
-            let fd = libc::socket(libc::AF_XDP, libc::SOCK_RAW, 0);
+            // 1. Socket
+            let fd = socket(AF_XDP, SOCK_RAW, 0);
+            if fd < 0 { return Err(anyhow!("Failed to create socket")); }
 
-            if fd < 0 {
-                return Err(anyhow::anyhow!("Failed to create AF_XDP socket"));
-            }
-
-            // Allocates Aligned Memory (UMEM)
-            let frame_size = 2048;
-            let frame_count = 4096;
-            let mem_size = frame_count * frame_size;
-            let page_size = 4096;
-
-            // Creates a layout: 8MB size, 4KB alignment
-            let layout = Layout::from_size_align(mem_size, page_size)
-                .context("Failed to create memory layout")?;
-
-            // Allocate
+            // 2. UMEM
+            let layout = Layout::from_size_align(UMEM_SIZE, 4096)?;
             let umem_ptr = alloc(layout);
-            if umem_ptr.is_null() {
-                libc::close(fd);
-                return Err(anyhow::anyhow!("Failed to allocate aligned memory"));
-            }
+            ptr::write_bytes(umem_ptr, 0, UMEM_SIZE);
 
-            // Clean the memory (Set to 0) to avoid garbage data
-            ptr::write_bytes(umem_ptr, 0, mem_size);
-
-            // Registers UMEM with the Kernel
             let mr = XdpUmemReg {
-                addr: umem_ptr as u64,
-                len: mem_size as u64,
-                chunk_size: frame_size as u32,
-                headroom: 0,
-                flags: 0,
+                addr: umem_ptr as u64, len: UMEM_SIZE as u64, chunk_size: FRAME_SIZE as u32, headroom: 0, flags: 0,
             };
-
-            let ret = libc::setsockopt(
-                fd,
-                SOL_XDP,
-                XDP_UMEM_REG,
-                &mr as *const _ as *const _,
-                mem::size_of::<XdpUmemReg>() as u32,
-            );
-
-            if ret != 0 {
-                dealloc(umem_ptr, layout);
-                libc::close(fd);
-                return Err(anyhow::anyhow!(
-                    "Failed to register UMEM (Error: {})",
-                    std::io::Error::last_os_error()
-                ));
+            if setsockopt(fd, SOL_XDP, XDP_UMEM_REG, &mr as *const _ as *const _, mem::size_of::<XdpUmemReg>() as u32) != 0 {
+                return Err(anyhow!("Failed to register UMEM"));
             }
 
-            // Configuring All Rings
-            let ring_size: u32 = 2048;
+            // 3. Ring Sizes
+            setsockopt(fd, SOL_XDP, XDP_UMEM_FILL_RING, &RING_SIZE as *const _ as *const _, 4);
+            setsockopt(fd, SOL_XDP, XDP_UMEM_COMPLETION_RING, &RING_SIZE as *const _ as *const _, 4);
+            setsockopt(fd, SOL_XDP, XDP_RX_RING, &RING_SIZE as *const _ as *const _, 4);
+            setsockopt(fd, SOL_XDP, XDP_TX_RING, &RING_SIZE as *const _ as *const _, 4);
 
-            libc::setsockopt(
-                fd,
-                SOL_XDP,
-                XDP_UMEM_FILL_RING,
-                &ring_size as *const _ as *const _,
-                4,
-            );
-            libc::setsockopt(
-                fd,
-                SOL_XDP,
-                XDP_UMEM_COMPLETION_RING,
-                &ring_size as *const _ as *const _,
-                4,
-            );
-            libc::setsockopt(
-                fd,
-                SOL_XDP,
-                XDP_RX_RING,
-                &ring_size as *const _ as *const _,
-                4,
-            );
-            libc::setsockopt(
-                fd,
-                SOL_XDP,
-                XDP_TX_RING,
-                &ring_size as *const _ as *const _,
-                4,
-            );
-
-            // Get Offsets (Where exactly are the rings in the file descriptor)
+            // 4. Offsets
             let mut off = XdpMmapOffsets::default();
             let mut optlen = mem::size_of::<XdpMmapOffsets>() as u32;
-            if libc::getsockopt(
-                fd,
-                SOL_XDP,
-                XDP_MMAP_OFFSETS,
-                &mut off as *mut _ as *mut _,
-                &mut optlen,
-            ) != 0
-            {
-                dealloc(umem_ptr, layout);
-                libc::close(fd);
-                return Err(anyhow::anyhow!("Failed to get offsets"));
-            }
+            libc::getsockopt(fd, SOL_XDP, XDP_MMAP_OFFSETS, &mut off as *mut _ as *mut _, &mut optlen);
 
-            // Map Fill Ring
-            let fill_len = off.fr.desc as usize + (ring_size as usize * 8);
-            let fill_map = libc::mmap(
-                ptr::null_mut(),
-                fill_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_POPULATE,
-                fd,
-                XDP_UMEM_PGOFF_FILL_RING as i64,
-            );
-            if fill_map == libc::MAP_FAILED {
-                dealloc(umem_ptr, layout);
-                libc::close(fd);
-                return Err(anyhow::anyhow!("Failed to map Fill Ring"));
-            }
+            // 5. Map Rings
+            
+            // FILL (u64 = 8 bytes)
+            let fill_len = off.fr.desc as usize + (RING_SIZE as usize * 8);
+            let fill_map = mmap(ptr::null_mut(), fill_len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, XDP_UMEM_PGOFF_FILL_RING as i64);
+            if fill_map == MAP_FAILED { return Err(anyhow!("Failed to map Fill Ring")); }
+            
             let fill_ring = XdpRing {
                 producer: fill_map.offset(off.fr.producer as isize) as *mut AtomicU32,
                 consumer: fill_map.offset(off.fr.consumer as isize) as *mut AtomicU32,
                 desc: fill_map.offset(off.fr.desc as isize) as *mut u8,
-                size: ring_size,
-                ptr: fill_map,
-                len: fill_len,
-                cached_cons: 0,
+                size: RING_SIZE, ptr: fill_map, len: fill_len,
             };
 
-            // Map RX Ring
-            let rx_len = off.rx.desc as usize + (ring_size as usize * 16);
-            let rx_map = libc::mmap(
-                ptr::null_mut(),
-                rx_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_POPULATE,
-                fd,
-                XDP_PGOFF_RX_RING as i64,
-            );
-            if rx_map == libc::MAP_FAILED {
-                libc::munmap(fill_ring.ptr, fill_ring.len);
-                dealloc(umem_ptr, layout);
-                libc::close(fd);
-                return Err(anyhow::anyhow!("Failed to map RX Ring"));
+            // COMP (u64 = 8 bytes)
+            let comp_len = off.cr.desc as usize + (RING_SIZE as usize * 8);
+            let comp_map = mmap(ptr::null_mut(), comp_len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, XDP_UMEM_PGOFF_COMPLETION_RING as i64);
+            if comp_map == MAP_FAILED { return Err(anyhow!("Failed to map Completion Ring")); }
+            
+            let comp_ring = XdpRing {
+                producer: comp_map.offset(off.cr.producer as isize) as *mut AtomicU32,
+                consumer: comp_map.offset(off.cr.consumer as isize) as *mut AtomicU32,
+                desc: comp_map.offset(off.cr.desc as isize) as *mut u8,
+                size: RING_SIZE, ptr: comp_map, len: comp_len,
+            };
+
+            // RX (xdp_desc = 16 bytes)
+            let rx_len = off.rx.desc as usize + (RING_SIZE as usize * 16); 
+            let rx_map = mmap(ptr::null_mut(), rx_len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, XDP_PGOFF_RX_RING);
+            if rx_map == MAP_FAILED { 
+                return Err(anyhow!("Failed to map RX Ring: {}", std::io::Error::last_os_error())); 
             }
+            
             let rx_ring = XdpRing {
                 producer: rx_map.offset(off.rx.producer as isize) as *mut AtomicU32,
                 consumer: rx_map.offset(off.rx.consumer as isize) as *mut AtomicU32,
                 desc: rx_map.offset(off.rx.desc as isize) as *mut u8,
-                size: ring_size,
-                ptr: rx_map,
-                len: rx_len,
-                cached_cons: 0,
+                size: RING_SIZE, ptr: rx_map, len: rx_len,
             };
 
-            // Binds the Socket
-            let if_name = CString::new(iface)?;
-            let if_index = libc::if_nametoindex(if_name.as_ptr());
-            let mut sa: libc::sockaddr_xdp = mem::zeroed();
-            sa.sxdp_family = libc::AF_XDP as u16;
-            sa.sxdp_ifindex = if_index;
-            sa.sxdp_queue_id = queue_id;
+            // TX (xdp_desc = 16 bytes)
+            let tx_len = off.tx.desc as usize + (RING_SIZE as usize * 16);
+            let tx_map = mmap(ptr::null_mut(), tx_len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, libc::XDP_PGOFF_TX_RING);
+            if tx_map == MAP_FAILED { return Err(anyhow!("Failed to map TX Ring")); }
+            
+            let tx_ring = XdpRing {
+                producer: tx_map.offset(off.tx.producer as isize) as *mut AtomicU32,
+                consumer: tx_map.offset(off.tx.consumer as isize) as *mut AtomicU32,
+                desc: tx_map.offset(off.tx.desc as isize) as *mut u8,
+                size: RING_SIZE, ptr: tx_map, len: tx_len,
+            };
 
-            // Try Zero-Copy (Flags=0), fallback to Copy Mode
-            sa.sxdp_flags = 0;
-            if libc::bind(
-                fd,
-                &sa as *const _ as *const _,
-                mem::size_of::<libc::sockaddr_xdp>() as u32,
-            ) != 0
-            {
+            // 6. Init Fill
+            let mut prod = (*fill_ring.producer).load(Ordering::Acquire);
+            let desc_ptr = fill_ring.desc as *mut u64;
+            for i in 0..(NUM_FRAMES / 2) {
+                 *desc_ptr.add((prod as usize) & (RING_SIZE as usize - 1)) = (i * FRAME_SIZE) as u64;
+                 prod += 1;
+            }
+            (*fill_ring.producer).store(prod, Ordering::Release);
+
+            // 7. Init TX
+            let mut tx_free_frames = Vec::new();
+            for i in (NUM_FRAMES/2)..NUM_FRAMES { tx_free_frames.push((i * FRAME_SIZE) as u64); }
+
+            // 8. Bind
+            let if_name = CString::new(iface)?;
+            let mut sa: libc::sockaddr_xdp = mem::zeroed();
+            sa.sxdp_family = AF_XDP as u16;
+            sa.sxdp_ifindex = libc::if_nametoindex(if_name.as_ptr());
+            sa.sxdp_queue_id = queue_id;
+            
+            if libc::bind(fd, &sa as *const _ as *const _, mem::size_of::<libc::sockaddr_xdp>() as u32) != 0 {
                 sa.sxdp_flags = XDP_COPY;
-                if libc::bind(
-                    fd,
-                    &sa as *const _ as *const _,
-                    mem::size_of::<libc::sockaddr_xdp>() as u32,
-                ) != 0
-                {
-                    libc::munmap(fill_ring.ptr, fill_ring.len);
-                    libc::munmap(rx_ring.ptr, rx_ring.len);
-                    dealloc(umem_ptr, layout);
-                    libc::close(fd);
-                    return Err(anyhow::anyhow!(
-                        "Failed to bind. Error: {}",
-                        std::io::Error::last_os_error()
-                    ));
-                }
+                libc::bind(fd, &sa as *const _ as *const _, mem::size_of::<libc::sockaddr_xdp>() as u32);
             }
 
             Ok(XdpSocket {
-                fd,
-                umem_ptr,
-                umem_layout: layout,
-                rx_ring,
-                fill_ring,
+                fd, umem_ptr, umem_layout: layout, rx_ring, tx_ring, fill_ring, comp_ring,
+                tx_free_frames, pending_tx_addr: None,
             })
         }
     }
 
-    pub fn fd(&self) -> RawFd {
-        self.fd
-    }
-
-    // Fill Ring : "Here are some buffers for you to fill, kernel"
-    pub fn populate_fill_ring(&mut self, n: u32) {
-        unsafe {
-            let prod = &*self.fill_ring.producer;
-            let mut prod_idx = prod.load(Ordering::Relaxed);
-
-            for i in 0..n {
-                let idx = prod_idx & (self.fill_ring.size - 1);
-                let desc_ptr = (self.fill_ring.desc as *mut u64).offset(idx as isize);
-                *desc_ptr = (i as u64) * 2048;
-                prod_idx += 1;
-            }
-            prod.store(prod_idx, Ordering::Release);
-        }
-    }
-
-    // RX Ring: "Any new packets for me?"
     pub fn poll_rx(&mut self) -> Option<(u64, usize)> {
         unsafe {
-            let rx_prod = (&*self.rx_ring.producer).load(Ordering::Acquire);
-            let rx_cons = (&*self.rx_ring.consumer).load(Ordering::Relaxed);
-
-            if rx_prod == rx_cons {
-                return None;
-            }
-
-            let idx = rx_cons & (self.rx_ring.size - 1);
-            let desc_ptr = self.rx_ring.desc.add((idx as usize) * 16);
-
-            // We read the 'addr' (offset) and 'len' from the descriptor
-            let addr = *(desc_ptr as *const u64);
-            let len = *(desc_ptr.add(8) as *const u32);
-
-            (&*self.rx_ring.consumer).store(rx_cons + 1, Ordering::Release);
-
-            // Recycle buffer to Fill Ring
-            let fill_prod = &*self.fill_ring.producer;
-            let fill_prod_idx = fill_prod.load(Ordering::Relaxed);
-
-            if fill_prod_idx - self.fill_ring.cached_cons >= self.fill_ring.size {
-                self.fill_ring.cached_cons = (&*self.fill_ring.consumer).load(Ordering::Acquire);
-            }
-
-            if fill_prod_idx - self.fill_ring.cached_cons < self.fill_ring.size {
-                let fill_idx = fill_prod_idx & (self.fill_ring.size - 1);
-                let fill_desc = (self.fill_ring.desc as *mut u64).offset(fill_idx as isize);
-                *fill_desc = addr;
-                fill_prod.store(fill_prod_idx + 1, Ordering::Release);
-            }
-
-            Some((addr, len as usize))
+            let cons = (*self.rx_ring.consumer).load(Ordering::Relaxed);
+            let prod = (*self.rx_ring.producer).load(Ordering::Acquire);
+            if cons == prod { return None; }
+            let idx = cons & (self.rx_ring.size - 1);
+            let desc = &*(self.rx_ring.desc as *const XdpDesc).add(idx as usize);
+            let addr = desc.addr;
+            let len = desc.len as usize;
+            (*self.rx_ring.consumer).store(cons + 1, Ordering::Release);
+            
+            // Return frame to fill ring for reuse
+            let fill_prod = (*self.fill_ring.producer).load(Ordering::Relaxed);
+            let fill_idx = fill_prod & (self.fill_ring.size - 1);
+            let fill_desc = self.fill_ring.desc as *mut u64;
+            *fill_desc.add(fill_idx as usize) = addr;
+            (*self.fill_ring.producer).store(fill_prod + 1, Ordering::Release);
+            
+            Some((addr, len))
         }
     }
-}
 
-impl Drop for XdpSocket {
-    fn drop(&mut self) {
+    pub fn get_tx_frame(&mut self) -> Option<&mut [u8]> {
         unsafe {
-            libc::munmap(self.rx_ring.ptr, self.rx_ring.len);
-            libc::munmap(self.fill_ring.ptr, self.fill_ring.len);
-            dealloc(self.umem_ptr, self.umem_layout);
-            libc::close(self.fd);
+            let cons = (*self.comp_ring.consumer).load(Ordering::Relaxed);
+            let prod = (*self.comp_ring.producer).load(Ordering::Acquire);
+            let mut c = cons;
+            while c != prod {
+                self.tx_free_frames.push(*(self.comp_ring.desc as *const u64).add((c & (self.comp_ring.size - 1)) as usize));
+                c += 1;
+            }
+            if c != cons { (*self.comp_ring.consumer).store(c, Ordering::Release); }
+
+            let t_prod = (*self.tx_ring.producer).load(Ordering::Relaxed);
+            let t_cons = (*self.tx_ring.consumer).load(Ordering::Acquire);
+            if t_prod - t_cons >= self.tx_ring.size { return None; }
+        }
+
+        if let Some(addr) = self.tx_free_frames.pop() {
+            self.pending_tx_addr = Some(addr);
+            let ptr = unsafe { self.umem_ptr.add(addr as usize) };
+            return Some(unsafe { std::slice::from_raw_parts_mut(ptr, FRAME_SIZE) });
+        }
+        None
+    }
+
+    pub fn tx_submit(&mut self, len: usize) {
+        if let Some(addr) = self.pending_tx_addr.take() {
+            unsafe {
+                let prod = (*self.tx_ring.producer).load(Ordering::Relaxed);
+                let d = (self.tx_ring.desc as *mut XdpDesc).add((prod & (self.tx_ring.size - 1)) as usize);
+                (*d).addr = addr; (*d).len = len as u32; (*d).options = 0;
+                (*self.tx_ring.producer).store(prod + 1, Ordering::Release);
+                libc::sendto(self.fd, ptr::null(), 0, libc::MSG_DONTWAIT, ptr::null(), 0);
+            }
+        }
+    }
+
+    pub fn cancel_tx(&mut self) {
+        if let Some(addr) = self.pending_tx_addr.take() {
+            self.tx_free_frames.push(addr);
         }
     }
 }

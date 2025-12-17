@@ -1,160 +1,100 @@
-mod xsk;
-
-use anyhow::Context;
-use aya::maps::XskMap;
-use aya::programs::{Xdp, XdpFlags};
-use aya::{include_bytes_aligned, Ebpf};
-use clap::Parser;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::signal;
+use clap::Parser;
+use aya::{programs::{Xdp, XdpFlags}, maps::XskMap, Ebpf};
+
+mod xsk;
+mod headers;
+mod quic_driver;
+mod emit;
+mod flood;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(short, long, default_value = "eth0")]
+    #[arg(short, long)]
     iface: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
-    env_logger::init();
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-
-    println!("Starting Afterburner on interface {}", args.iface);
-
-    // Load BPF Binary
-    #[cfg(debug_assertions)]
-    let mut bpf = Ebpf::load(include_bytes_aligned!(
-        "../../target/bpfel-unknown-none/release/afterburner"
-    ))?;
-
-    #[cfg(not(debug_assertions))]
-    let mut bpf = Ebpf::load(include_bytes_aligned!(
-        "../../target/bpfel-unknown-none/release/afterburner"
-    ))?;
-
-    // Load Program from Binary
-    let program: &mut Xdp = bpf
-        .program_mut("afterburner")
-        .unwrap()
-        .try_into()
-        .context("Failed to load the XDP program")?;
-
-    program.load()?;
-
-    // Attach Program (Driver Mode -> Generic Fallback)
-    println!("Attempting to attach in Driver Mode...");
-    if program.attach(&args.iface, XdpFlags::default()).is_err() {
-        program.attach(&args.iface, XdpFlags::SKB_MODE)?;
-        println!("Attached in Generic Mode (Slower, but compatible).");
-    } else {
-        println!("Attached in Driver Mode (Hardware Speed).");
-    }
-
-    // Create AF_XDP Socket
-    println!("Createing AF_XDP socket...");
-    let mut socket = xsk::XdpSocket::new(&args.iface, 0).context("Failed to create XDP socket")?;
-
-    // Connect Socket to BPF Map
-    let mut xsk_map: XskMap<aya::maps::MapData> = bpf.take_map("XSK").unwrap().try_into()?;
-
-    xsk_map
-        .set(0, socket.fd(), 0)
-        .context("Failed to insert socket into XSK Map")?;
-
-    // We give the Kernel 2048 empty buffers *before* we start.
-    // If we don't do this, the Kernel will drop incoming packets immediately.
-    println!("Priming Fill Ring...");
-    socket.populate_fill_ring(2048);
-
-    println!("Afterburner is Live, Waiting for UDP packets on Port 8003...");
-
-    // Run the Receive Loop
+    
     let term = Arc::new(AtomicBool::new(false));
-    let term_c = term.clone();
-    tokio::spawn(async move {
-        signal::ctrl_c().await.unwrap();
-        term_c.store(true, Ordering::Relaxed);
-    });
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term))?;
 
-    const HEADER_SIZE: usize = 42;
-    const SIG_SIZE: usize = 64;
-    const PUBKEY_SIZE: usize = 32;
+    println!("Starting Afterburner QUIC on: {}", args.iface);
 
-    let mut packet_count: u64 = 0;
+    let ebpf_path = std::path::Path::new("target/bpfel-unknown-none/release/afterburner");
+    let mut bpf = Ebpf::load_file(ebpf_path)?;
+    
+    let program: &mut Xdp = bpf.program_mut("afterburner").unwrap().try_into()?;
+    program.load()?;
+    program.attach(&args.iface, XdpFlags::default())?;
+    println!("[XDP] eBPF program attached to {}", args.iface);
+
+    let mut socket = xsk::XdpSocket::new(&args.iface, 0)?;
+    
+    let mut xsk_map = XskMap::try_from(bpf.map_mut("XSK").unwrap())?;
+    xsk_map.set(0, socket.fd, 0)?;
+    println!("[XSK] AF_XDP socket registered");
+    
+    let local: SocketAddr = "10.0.0.10:8000".parse()?;
+    let peer: SocketAddr = "10.0.0.11:8004".parse()?;
+    let scid = [0x55; 20];
+    let mut driver = quic_driver::QuicDriver::new(&scid, local, peer);
+    let mut flooder = flood::Flooder::new();
+
+    println!("[RUN] HFT Loop Running (Bidirectional Mode)");
 
     while !term.load(Ordering::Relaxed) {
-        match socket.poll_rx() {
-            Some((addr, len)) => {
-                packet_count += 1;
-
-                let packet_ptr = unsafe { socket.umem_ptr.add(addr as usize) };
-                let raw_data = unsafe { std::slice::from_raw_parts(packet_ptr, len) };
-
-                if len > HEADER_SIZE {
-                    let mut cursor = HEADER_SIZE;
-
-                    if cursor < len {
-                        // 1. Skip Signatures
-                        let num_sigs = raw_data[cursor] as usize;
-                        cursor += 1;
-                        cursor += num_sigs * SIG_SIZE;
-
-                        // 2. Skip Message Header (3 bytes)
-                        cursor += 3;
-
-                        // 3. Skip Accounts
-                        if cursor < len {
-                            let num_accounts = raw_data[cursor] as usize;
-                            cursor += 1;
-                            cursor += num_accounts * PUBKEY_SIZE;
-
-                            // 4. Skip Blockhash (32 bytes)
-                            cursor += 32;
-
-                            // 5. Parse Instructions
-                            if cursor < len {
-                                let _num_instructions = raw_data[cursor];
-                                cursor += 1;
-
-                                // Parse First Instruction Only
-                                if cursor + 2 < len {
-                                    let _prog_id_idx = raw_data[cursor];
-                                    let acc_indices_len = raw_data[cursor + 1] as usize;
-
-                                    cursor += 2 + acc_indices_len;
-
-                                    if cursor < len {
-                                        let data_len = raw_data[cursor] as usize;
-                                        cursor += 1;
-
-                                        if cursor + data_len <= len {
-                                            let instruction_data =
-                                                &raw_data[cursor..cursor + data_len];
-                                            print!("Packet #{}: Instruction: ", packet_count);
-
-                                            for b in instruction_data {
-                                                print!("{:02X} ", b);
-                                            }
-                                            println!();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            None => {
-                // std::thread::sleep(Duration::from_millis(1)); // This reduces CPU usage, but increases latency.
-
-                std::hint::spin_loop(); // This keeps the CPU core at 100% usage, but reduces latency.
+        if let Some((addr, len)) = socket.poll_rx() {
+            let ptr = unsafe { socket.umem_ptr.add(addr as usize) };
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            if len > 42 {
+                driver.process_input(&mut slice[42..], local, peer);
             }
         }
+
+        driver.on_timeout();
+        driver.drain_streams();
+        flooder.shoot(&mut driver);
+
+        while let Some(frame) = socket.get_tx_frame() {
+            match driver.write_transmit(&mut frame[42..]) {
+                Some(quic_len) if quic_len > 0 => {
+                    headers::write_headers(frame, quic_len, 8000, 8004);
+                    socket.tx_submit(42 + quic_len);
+                },
+                _ => {
+                    socket.cancel_tx();
+                    break;
+                }
+            }
+        }
+        
+        std::hint::spin_loop(); 
     }
 
-    println!("Exiting Afterburner...");
-
+    println!("Shutting down. Total TX Sent: {}", flooder.tx_count);
+    let _ = driver.conn.close(true, 0, b"done");
+    
+    for _ in 0..16 {
+        if let Some(frame) = socket.get_tx_frame() {
+            match driver.write_transmit(&mut frame[42..]) {
+                Some(quic_len) if quic_len > 0 => {
+                    headers::write_headers(frame, quic_len, 8000, 8004);
+                    socket.tx_submit(42 + quic_len);
+                },
+                _ => {
+                    socket.cancel_tx();
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    
     Ok(())
 }

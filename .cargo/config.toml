@@ -3,3 +3,6 @@ rustflags = [
     "-C", "linker=bpf-linker", 
     "-C", "link-arg=--btf",
 ]
+
+[alias]
+xtask = "run --package xtask --release --"
