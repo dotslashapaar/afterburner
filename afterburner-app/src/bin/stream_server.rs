@@ -1,12 +1,13 @@
 use std::net::SocketAddr;
+use std::panic;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
-    config.set_application_protos(&[b"solana-tpu"])?;
-    config.load_cert_chain_from_pem_file("cert.crt")?;
-    config.load_priv_key_from_pem_file("cert.key")?;
+async fn main() {
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("new");
+    config.set_application_protos(&[b"solana-tpu"]).expect("set_application_protos");
+    config.load_cert_chain_from_pem_file("cert.crt").expect("load_cert_chain_from_pem_file");
+    config.load_priv_key_from_pem_file("cert.key").expect("load_priv_key_from_pem_file");
     
     config.set_initial_max_data(100_000_000);
     config.set_initial_max_stream_data_bidi_local(10_000_000);
@@ -17,8 +18,8 @@ async fn main() -> anyhow::Result<()> {
     config.set_max_ack_delay(0); 
     config.set_ack_delay_exponent(0);
 
-    let socket = std::net::UdpSocket::bind("10.0.0.11:8004")?;
-    socket.set_nonblocking(true)?;
+    let socket = std::net::UdpSocket::bind("10.0.0.11:8004").expect("bind");
+    socket.set_nonblocking(true).expect("set_nonblocking");
     println!("[SERVER] Listening on 10.0.0.11:8004");
 
     let mut buf = [0u8; 65535];
@@ -37,13 +38,13 @@ async fn main() -> anyhow::Result<()> {
         match read_result {
             Ok((len, src)) => {
                 client_addr = Some(src);
-                let recv_info = quiche::RecvInfo { from: src, to: socket.local_addr()? };
+                let recv_info = quiche::RecvInfo { from: src, to: socket.local_addr().expect("local_addr") };
                 
                 if conn.is_none() {
                      println!("[SERVER] Client connected from {}", src);
                      if let Ok(hdr) = quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
                         let scid = quiche::ConnectionId::from_ref(&hdr.scid);
-                        let c = quiche::accept(&scid, None, socket.local_addr()?, src, &mut config)?;
+                        let c = quiche::accept(&scid, None, socket.local_addr().expect("local_addr"), src, &mut config).expect("accept");
                         conn = Some(Box::pin(c));
                     }
                 }
@@ -61,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
                     
                     if let Some(target) = client_addr {
                         if c.is_established() && last_send.elapsed() >= packet_interval {
-                            let now_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
+                            let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).expect("duration_since").as_nanos() as u64;
                             
                             let mut payload = [0u8; 17];
                             payload[0] = 0xA5; 
@@ -96,7 +97,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 std::hint::spin_loop();
             },
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                panic::panic_any(e)
+            }
         }
     }
 }

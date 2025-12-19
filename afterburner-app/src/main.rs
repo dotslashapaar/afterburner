@@ -17,30 +17,30 @@ struct Args {
     iface: String,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
     let args = Args::parse();
     
     let term = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term))?;
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term)).expect("register");
 
     println!("Starting Afterburner QUIC on: {}", args.iface);
 
     let ebpf_path = std::path::Path::new("target/bpfel-unknown-none/release/afterburner");
-    let mut bpf = Ebpf::load_file(ebpf_path)?;
+    let mut bpf = Ebpf::load_file(ebpf_path).expect("Ebpf::load_file");
     
-    let program: &mut Xdp = bpf.program_mut("afterburner").unwrap().try_into()?;
-    program.load()?;
-    program.attach(&args.iface, XdpFlags::default())?;
+    let program: &mut Xdp = bpf.program_mut("afterburner").unwrap().try_into().expect("try_into");
+    program.load().expect("load");
+    program.attach(&args.iface, XdpFlags::default()).expect("attach");
     println!("[XDP] eBPF program attached to {}", args.iface);
 
-    let mut socket = xsk::XdpSocket::new(&args.iface, 0)?;
+    let mut socket = xsk::XdpSocket::new(&args.iface, 0).expect("XdpSocket::new");
     
-    let mut xsk_map = XskMap::try_from(bpf.map_mut("XSK").unwrap())?;
-    xsk_map.set(0, socket.fd, 0)?;
+    let mut xsk_map = XskMap::try_from(bpf.map_mut("XSK").unwrap()).expect("XskMap::try_from");
+    xsk_map.set(0, socket.fd, 0).expect("XskMap::set");
     println!("[XSK] AF_XDP socket registered");
     
-    let local: SocketAddr = "10.0.0.10:8000".parse()?;
-    let peer: SocketAddr = "10.0.0.11:8004".parse()?;
+    let local: SocketAddr = "10.0.0.10:8000".parse().expect("parse local addr");
+    let peer: SocketAddr = "10.0.0.11:8004".parse().expect("parse peer addr");
     let scid = [0x55; 20];
     let mut driver = quic_driver::QuicDriver::new(&scid, local, peer);
     let mut flooder = flood::Flooder::new();
@@ -95,6 +95,4 @@ fn main() -> anyhow::Result<()> {
             break;
         }
     }
-    
-    Ok(())
 }

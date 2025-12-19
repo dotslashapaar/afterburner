@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-fn main() -> Result<(), anyhow::Error> {
+fn main(){
     let target = "bpfel-unknown-none";
 
-    let dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
+    let dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("env::var"));
 
     let root = dir.parent().expect("Could not find workspace root");
 
@@ -20,12 +20,12 @@ fn main() -> Result<(), anyhow::Error> {
             "-Z",
             "build-std=core",
         ])
-        .status()?;
+        .status()
+        .expect("status");
 
     if !status.success() {
-        anyhow::bail!("Failed to build eBPF program");
+        panic!("Failed to build eBPF program");
     }
 
     println!("eBPF Program Compiled Successfully");
-    Ok(())
 }

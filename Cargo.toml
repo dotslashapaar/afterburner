@@ -6,10 +6,38 @@ members = [
     "xtask",
 ]
 
-resolver = "2"
+[workspace.package]
+edition = "2021"
 
 [profile.dev]
 panic = "abort"
 
 [profile.release]
 panic = "abort"
+
+
+[workspace.dependencies]
+aya = "0.13"
+aya-log = "0.2"
+
+aya-ebpf = { git = "https://github.com/aya-rs/aya", branch = "main" }
+aya-log-ebpf = { git = "https://github.com/aya-rs/aya", branch = "main" }
+afterburner-common = { path = "afterburner-common" }
+network-types = "0.0.5"
+
+clap = { version = "4.0", features = ["derive"] }
+env_logger = "0.10"
+libc = "0.2"
+tokio = { version = "1.28", features = ["full"] }
+serde = { version = "1", default-features = false }
+signal-hook = "0.3"
+
+# QUIC Stack 
+quiche = "0.22"
+ring = "0.17"
+
+# Test Server Tools
+quinn = "0.11" 
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] } 
+rcgen = "0.13" 
+rustls-pki-types = "1.7"

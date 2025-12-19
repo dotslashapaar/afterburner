@@ -1,9 +1,8 @@
 use std::ffi::CString;
-use std::mem;
+use std::{io, mem};
 use std::os::fd::RawFd;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use anyhow::{anyhow, Result};
 use libc::{
     close, mmap, munmap, setsockopt, socket, AF_XDP, MAP_ANONYMOUS, MAP_FAILED,
     MAP_HUGETLB, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, PROT_READ, PROT_WRITE,
@@ -20,7 +19,7 @@ const RING_SIZE: u32 = 2048;
 
 /// Allocate UMEM buffer using mmap, attempting HUGETLB for better TLB performance.
 /// Falls back to regular pages if huge pages are unavailable.
-unsafe fn allocate_umem(size: usize) -> Result<*mut u8> {
+unsafe fn allocate_umem(size: usize) -> Result<*mut u8, io::Error> {
     // Try with HUGETLB first (2MB pages reduce TLB entries from 2048 to 4 for 8MB)
     let ptr = mmap(
         ptr::null_mut(),
@@ -49,7 +48,7 @@ unsafe fn allocate_umem(size: usize) -> Result<*mut u8> {
     );
 
     if ptr == MAP_FAILED {
-        return Err(anyhow!("Failed to allocate UMEM: {}", std::io::Error::last_os_error()));
+        return Err(std::io::Error::last_os_error());
     }
 
     Ok(ptr as *mut u8)
@@ -112,11 +111,11 @@ pub struct XdpSocket {
 }
 
 impl XdpSocket {
-    pub fn new(iface: &str, queue_id: u32) -> Result<Self> {
+    pub fn new(iface: &str, queue_id: u32) -> Result<Self, io::Error> {
         unsafe {
             // 1. Socket
             let fd = socket(AF_XDP, SOCK_RAW, 0);
-            if fd < 0 { return Err(anyhow!("Failed to create socket")); }
+            if fd < 0 { return Err(io::Error::last_os_error()); }
 
             // 2. UMEM (using mmap with HUGETLB for better TLB performance)
             let umem_ptr = allocate_umem(UMEM_SIZE)?;
@@ -125,7 +124,7 @@ impl XdpSocket {
                 addr: umem_ptr as u64, len: UMEM_SIZE as u64, chunk_size: FRAME_SIZE as u32, headroom: 0, flags: 0,
             };
             if setsockopt(fd, SOL_XDP, XDP_UMEM_REG, &mr as *const _ as *const _, mem::size_of::<XdpUmemReg>() as u32) != 0 {
-                return Err(anyhow!("Failed to register UMEM"));
+                return Err(io::Error::last_os_error());
             }
 
             // 3. Ring Sizes
@@ -144,7 +143,7 @@ impl XdpSocket {
             // FILL (u64 = 8 bytes)
             let fill_len = off.fr.desc as usize + (RING_SIZE as usize * 8);
             let fill_map = mmap(ptr::null_mut(), fill_len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, XDP_UMEM_PGOFF_FILL_RING as i64);
-            if fill_map == MAP_FAILED { return Err(anyhow!("Failed to map Fill Ring")); }
+            if fill_map == MAP_FAILED { return Err(std::io::Error::last_os_error()); }
             
             let fill_ring = XdpRing {
                 producer: fill_map.offset(off.fr.producer as isize) as *mut AtomicU32,
@@ -156,7 +155,7 @@ impl XdpSocket {
             // COMP (u64 = 8 bytes)
             let comp_len = off.cr.desc as usize + (RING_SIZE as usize * 8);
             let comp_map = mmap(ptr::null_mut(), comp_len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, XDP_UMEM_PGOFF_COMPLETION_RING as i64);
-            if comp_map == MAP_FAILED { return Err(anyhow!("Failed to map Completion Ring")); }
+            if comp_map == MAP_FAILED { return Err(std::io::Error::last_os_error()); }
             
             let comp_ring = XdpRing {
                 producer: comp_map.offset(off.cr.producer as isize) as *mut AtomicU32,
@@ -169,7 +168,7 @@ impl XdpSocket {
             let rx_len = off.rx.desc as usize + (RING_SIZE as usize * 16); 
             let rx_map = mmap(ptr::null_mut(), rx_len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, XDP_PGOFF_RX_RING);
             if rx_map == MAP_FAILED { 
-                return Err(anyhow!("Failed to map RX Ring: {}", std::io::Error::last_os_error())); 
+                return Err(std::io::Error::last_os_error()); 
             }
             
             let rx_ring = XdpRing {
@@ -182,7 +181,7 @@ impl XdpSocket {
             // TX (xdp_desc = 16 bytes)
             let tx_len = off.tx.desc as usize + (RING_SIZE as usize * 16);
             let tx_map = mmap(ptr::null_mut(), tx_len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, libc::XDP_PGOFF_TX_RING);
-            if tx_map == MAP_FAILED { return Err(anyhow!("Failed to map TX Ring")); }
+            if tx_map == MAP_FAILED { return Err(std::io::Error::last_os_error()); }
             
             let tx_ring = XdpRing {
                 producer: tx_map.offset(off.tx.producer as isize) as *mut AtomicU32,
