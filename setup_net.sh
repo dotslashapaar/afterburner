@@ -15,9 +15,9 @@ sudo ip link set veth0 up
 sudo ip netns exec ns1 ip addr add 10.0.0.11/24 dev veth1
 sudo ip netns exec ns1 ip link set veth1 up
 
-# 6. Turn off offloading (Crucial for AF_XDP)
-sudo ethtool -K veth0 gro off
-sudo ip netns exec ns1 ethtool -K veth1 gro off
+# 6. Turn off offloading (Crucial for AF_XDP with fixed frame sizes)
+sudo ethtool -K veth0 gro off lro off gso off tso off
+sudo ip netns exec ns1 ethtool -K veth1 gro off lro off gso off tso off
 
 # 7. Verify connectivity
 ping -c 2 10.0.0.11

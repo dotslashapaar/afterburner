@@ -13,7 +13,7 @@ use libc::{
 
 // Constants
 const UMEM_SIZE: usize = 8 * 1024 * 1024;
-const FRAME_SIZE: usize = 4096;
+pub const FRAME_SIZE: usize = 4096;
 const NUM_FRAMES: usize = UMEM_SIZE / FRAME_SIZE;
 const RING_SIZE: u32 = 2048;
 
@@ -108,6 +108,8 @@ pub struct XdpSocket {
     comp_ring: XdpRing,
     tx_free_frames: Vec<u64>,
     pending_tx_addr: Option<u64>,
+    #[cfg(debug_assertions)]
+    rx_frames_outstanding: u32,
 }
 
 impl XdpSocket {
@@ -126,7 +128,6 @@ impl XdpSocket {
             if setsockopt(fd, SOL_XDP, XDP_UMEM_REG, &mr as *const _ as *const _, mem::size_of::<XdpUmemReg>() as u32) != 0 {
                 return Err(io::Error::last_os_error());
             }
-
             // 3. Ring Sizes
             setsockopt(fd, SOL_XDP, XDP_UMEM_FILL_RING, &RING_SIZE as *const _ as *const _, 4);
             setsockopt(fd, SOL_XDP, XDP_UMEM_COMPLETION_RING, &RING_SIZE as *const _ as *const _, 4);
@@ -218,6 +219,8 @@ impl XdpSocket {
             Ok(XdpSocket {
                 fd, umem_ptr, umem_size: UMEM_SIZE, rx_ring, tx_ring, fill_ring, comp_ring,
                 tx_free_frames, pending_tx_addr: None,
+                #[cfg(debug_assertions)]
+                rx_frames_outstanding: 0,
             })
         }
     }
@@ -231,16 +234,54 @@ impl XdpSocket {
             let desc = &*(self.rx_ring.desc as *const XdpDesc).add(idx as usize);
             let addr = desc.addr;
             let len = desc.len as usize;
+            
+            // Validate addr is within RX UMEM region (first half of frames)
+            let max_valid_addr = (NUM_FRAMES / 2) * FRAME_SIZE;
+            if addr as usize >= max_valid_addr {
+                eprintln!("[XSK] Invalid RX addr: {} >= max {}", addr, max_valid_addr);
+                (*self.rx_ring.consumer).store(cons + 1, Ordering::Release);
+                return None;
+            }
+            
+            // Clamp len to FRAME_SIZE to prevent buffer overflow
+            let len = len.min(FRAME_SIZE);
+            
             (*self.rx_ring.consumer).store(cons + 1, Ordering::Release);
             
-            // Return frame to fill ring for reuse
+            #[cfg(debug_assertions)] {
+                self.rx_frames_outstanding += 1;
+            }
+            
+            Some((addr, len))
+        }
+    }
+
+    /// Release a received frame back to the fill ring after processing is complete.
+    /// 
+    /// # Safety
+    /// The caller must ensure:
+    /// - `addr` was previously returned by `poll_rx()`
+    /// - The frame data at `addr` is no longer being accessed
+    /// - Each frame is released exactly once
+    pub fn release_frame(&mut self, addr: u64) {
+        unsafe {
+            #[cfg(debug_assertions)] {
+                debug_assert!(self.rx_frames_outstanding > 0,
+                    "release_frame called but no frames outstanding (double release?)");
+                self.rx_frames_outstanding -= 1;
+            }
+            
             let fill_prod = (*self.fill_ring.producer).load(Ordering::Relaxed);
+            let fill_cons = (*self.fill_ring.consumer).load(Ordering::Acquire);
+            
+            // Safety check: fill ring full means we lost frames somewhere
+            debug_assert!(fill_prod.wrapping_sub(fill_cons) < self.fill_ring.size,
+                "Fill ring overflow: producer={}, consumer={}", fill_prod, fill_cons);
+            
             let fill_idx = fill_prod & (self.fill_ring.size - 1);
             let fill_desc = self.fill_ring.desc as *mut u64;
             *fill_desc.add(fill_idx as usize) = addr;
             (*self.fill_ring.producer).store(fill_prod + 1, Ordering::Release);
-            
-            Some((addr, len))
         }
     }
 
@@ -289,6 +330,12 @@ impl XdpSocket {
 
 impl Drop for XdpSocket {
     fn drop(&mut self) {
+        #[cfg(debug_assertions)] {
+            debug_assert!(self.rx_frames_outstanding == 0,
+                "XdpSocket dropped with {} unreleased RX frames (memory leak)",
+                self.rx_frames_outstanding);
+        }
+        
         unsafe {
             // Unmap ring buffers
             munmap(self.fill_ring.ptr, self.fill_ring.len);
