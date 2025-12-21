@@ -48,12 +48,15 @@ fn main() {
     println!("[RUN] HFT Loop Running (Bidirectional Mode)");
 
     while !term.load(Ordering::Relaxed) {
-        if let Some((addr, len)) = socket.poll_rx() {
+        // Process ALL available RX packets first - prevents backlog and fill ring starvation
+        while let Some((addr, len)) = socket.poll_rx() {
             let ptr = unsafe { socket.umem_ptr.add(addr as usize) };
             let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
             if len > 42 {
                 driver.process_input(&mut slice[42..], local, peer);
             }
+            // Release frame back to fill ring AFTER processing is complete
+            socket.release_frame(addr);
         }
 
         driver.on_timeout();
