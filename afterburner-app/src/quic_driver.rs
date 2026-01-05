@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::pin::Pin;
 
@@ -7,7 +8,7 @@ pub struct QuicDriver {
     closed_seen: bool,
     established_seen: bool,
     close_timer: Option<std::time::Instant>,
-    msg_buf: Vec<u8>,
+    msg_buf: VecDeque<u8>,
     stats_count: u64,
     stats_sum_ns: u64,
     min_lat_ns: u64,
@@ -44,7 +45,7 @@ impl QuicDriver {
             closed_seen: false,
             established_seen: false,
             close_timer: None,
-            msg_buf: Vec::with_capacity(1024),
+            msg_buf: VecDeque::with_capacity(1024),
             stats_count: 0,
             stats_sum_ns: 0,
             min_lat_ns: u64::MAX,
@@ -81,44 +82,52 @@ impl QuicDriver {
                 if read_len == 0 { break; }
                 
                 // Append new data to message buffer
-                self.msg_buf.extend_from_slice(&self.stream_buf[..read_len]);
+                self.msg_buf.extend(&self.stream_buf[..read_len]);
             }
             
             // Process complete 17-byte messages
             while self.msg_buf.len() >= 17 {
+                // make_contiguous() is cache-friendly for slice operations
+                let slice = self.msg_buf.make_contiguous();
+                
                 // Find magic byte
-                if self.msg_buf[0] != 0xA5 {
-                    // Discard byte and resync
-                    self.msg_buf.remove(0);
+                if slice[0] != 0xA5 {
+                    self.msg_buf.pop_front();
                     continue;
                 }
                 
-                // Extract complete message
-                let ts_bytes: [u8; 8] = self.msg_buf[1..9].try_into().unwrap();
+                // Extract message (DO NOT drain yet - need to validate first!)
+                let ts_bytes: [u8; 8] = slice[1..9].try_into().unwrap();
                 let server_ts = u64::from_le_bytes(ts_bytes);
                 
-                let seq_bytes: [u8; 8] = self.msg_buf[9..17].try_into().unwrap();
+                let seq_bytes: [u8; 8] = slice[9..17].try_into().unwrap();
                 let seq = u64::from_le_bytes(seq_bytes);
                 
-                // Remove processed message
-                self.msg_buf.drain(..17);
-                
-                // Loss Detection
-                if let Some(last) = self.last_seq {
-                    if seq > last + 1 {
-                        let gap = seq - last - 1;
-                        self.lost_packets += gap;
-                    }
-                }
-                self.last_seq = Some(seq);
-                
-                // Latency Calculation
+                // Get current time
                 let now_ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos() as u64;
                 
+                // SANITY CHECK: If garbage, this was a false 0xA5 - resync!
                 let latency_ns = now_ns.saturating_sub(server_ts);
+                if server_ts > now_ns.saturating_add(1_000_000_000) || latency_ns > 60_000_000_000 {
+                    // False positive 0xA5 in data - pop 1 byte and search for real header
+                    self.msg_buf.pop_front();
+                    continue;
+                }
+                
+                // NOW safe to drain - message is validated
+                self.msg_buf.drain(..17);
+                
+                // Loss Detection with sanity check (gap must be reasonable)
+                if let Some(last) = self.last_seq {
+                    if seq > last && seq - last <= 1_000_000 {
+                        let gap = seq - last - 1;
+                        self.lost_packets += gap;
+                    }
+                }
+                self.last_seq = Some(seq);
                 
                 if latency_ns < self.min_lat_ns { self.min_lat_ns = latency_ns; }
                 if latency_ns > self.max_lat_ns { self.max_lat_ns = latency_ns; }

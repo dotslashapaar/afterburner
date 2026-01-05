@@ -75,6 +75,7 @@ fn main() {
                 }
             }
         }
+        socket.flush_tx(); // Single syscall for entire TX batch
         
         std::hint::spin_loop(); 
     }
@@ -98,4 +99,5 @@ fn main() {
             break;
         }
     }
+    socket.flush_tx(); // Flush shutdown packets
 }

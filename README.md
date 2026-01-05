@@ -145,9 +145,9 @@ config.set_initial_max_streams_bidi(1000); // 1000 concurrent streams
 
 AF_XDP settings in `xsk.rs`:
 ```rust
-const UMEM_SIZE: usize = 8 * 1024 * 1024;  // 8MB shared memory
-const FRAME_SIZE: usize = 4096;             // 4KB per frame
-const RING_SIZE: u32 = 2048;                // Ring buffer depth
+const UMEM_SIZE: usize = 32 * 1024 * 1024;  // 32MB shared memory
+const FRAME_SIZE: usize = 4096;              // 4KB per frame
+const RING_SIZE: u32 = 4096;                 // Ring buffer depth
 ```
 
 ## Production Deployment
