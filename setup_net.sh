@@ -19,5 +19,9 @@ sudo ip netns exec ns1 ip link set veth1 up
 sudo ethtool -K veth0 gro off lro off gso off tso off
 sudo ip netns exec ns1 ethtool -K veth1 gro off lro off gso off tso off
 
-# 7. Verify connectivity
+# 7. Set txqueuelen to 1000 (default) for optimal latency
+sudo ip link set veth0 txqueuelen 1000
+sudo ip netns exec ns1 ip link set veth1 txqueuelen 1000
+
+# 8. Verify connectivity
 ping -c 2 10.0.0.11

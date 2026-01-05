@@ -12,10 +12,12 @@ use libc::{
 };
 
 // Constants
-const UMEM_SIZE: usize = 8 * 1024 * 1024;
+// 32MB UMEM = 8192 frames (4096 RX + 4096 TX)
+const UMEM_SIZE: usize = 32 * 1024 * 1024;
 pub const FRAME_SIZE: usize = 4096;
 const NUM_FRAMES: usize = UMEM_SIZE / FRAME_SIZE;
-const RING_SIZE: u32 = 2048;
+// Ring size 4096 is optimal for veth driver
+const RING_SIZE: u32 = 4096;
 
 /// Allocate UMEM buffer using mmap, attempting HUGETLB for better TLB performance.
 /// Falls back to regular pages if huge pages are unavailable.
@@ -129,15 +131,25 @@ impl XdpSocket {
                 return Err(io::Error::last_os_error());
             }
             // 3. Ring Sizes
-            setsockopt(fd, SOL_XDP, XDP_UMEM_FILL_RING, &RING_SIZE as *const _ as *const _, 4);
-            setsockopt(fd, SOL_XDP, XDP_UMEM_COMPLETION_RING, &RING_SIZE as *const _ as *const _, 4);
-            setsockopt(fd, SOL_XDP, XDP_RX_RING, &RING_SIZE as *const _ as *const _, 4);
-            setsockopt(fd, SOL_XDP, XDP_TX_RING, &RING_SIZE as *const _ as *const _, 4);
+            if setsockopt(fd, SOL_XDP, XDP_UMEM_FILL_RING, &RING_SIZE as *const _ as *const _, 4) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if setsockopt(fd, SOL_XDP, XDP_UMEM_COMPLETION_RING, &RING_SIZE as *const _ as *const _, 4) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if setsockopt(fd, SOL_XDP, XDP_RX_RING, &RING_SIZE as *const _ as *const _, 4) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if setsockopt(fd, SOL_XDP, XDP_TX_RING, &RING_SIZE as *const _ as *const _, 4) != 0 {
+                return Err(io::Error::last_os_error());
+            }
 
             // 4. Offsets
             let mut off = XdpMmapOffsets::default();
             let mut optlen = mem::size_of::<XdpMmapOffsets>() as u32;
-            libc::getsockopt(fd, SOL_XDP, XDP_MMAP_OFFSETS, &mut off as *mut _ as *mut _, &mut optlen);
+            if libc::getsockopt(fd, SOL_XDP, XDP_MMAP_OFFSETS, &mut off as *mut _ as *mut _, &mut optlen) != 0 {
+                return Err(io::Error::last_os_error());
+            }
 
             // 5. Map Rings
             
@@ -200,8 +212,8 @@ impl XdpSocket {
             }
             (*fill_ring.producer).store(prod, Ordering::Release);
 
-            // 7. Init TX
-            let mut tx_free_frames = Vec::new();
+            // 7. Init TX - Pre-allocate to prevent runtime resizing
+            let mut tx_free_frames = Vec::with_capacity(NUM_FRAMES);
             for i in (NUM_FRAMES/2)..NUM_FRAMES { tx_free_frames.push((i * FRAME_SIZE) as u64); }
 
             // 8. Bind
@@ -209,11 +221,16 @@ impl XdpSocket {
             let mut sa: libc::sockaddr_xdp = mem::zeroed();
             sa.sxdp_family = AF_XDP as u16;
             sa.sxdp_ifindex = libc::if_nametoindex(if_name.as_ptr());
+            if sa.sxdp_ifindex == 0 {
+                return Err(io::Error::new(io::ErrorKind::NotFound, format!("interface '{}' not found", iface)));
+            }
             sa.sxdp_queue_id = queue_id;
             
             if libc::bind(fd, &sa as *const _ as *const _, mem::size_of::<libc::sockaddr_xdp>() as u32) != 0 {
                 sa.sxdp_flags = XDP_COPY;
-                libc::bind(fd, &sa as *const _ as *const _, mem::size_of::<libc::sockaddr_xdp>() as u32);
+                if libc::bind(fd, &sa as *const _ as *const _, mem::size_of::<libc::sockaddr_xdp>() as u32) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
 
             Ok(XdpSocket {
@@ -315,9 +332,17 @@ impl XdpSocket {
                 let prod = (*self.tx_ring.producer).load(Ordering::Relaxed);
                 let d = (self.tx_ring.desc as *mut XdpDesc).add((prod & (self.tx_ring.size - 1)) as usize);
                 (*d).addr = addr; (*d).len = len as u32; (*d).options = 0;
+                // Commit to ring only - NIC not notified yet
                 (*self.tx_ring.producer).store(prod + 1, Ordering::Release);
-                libc::sendto(self.fd, ptr::null(), 0, libc::MSG_DONTWAIT, ptr::null(), 0);
             }
+        }
+    }
+
+    /// Kick the NIC doorbell - call once per batch after tx_submit calls
+    #[inline(always)]
+    pub fn flush_tx(&self) {
+        unsafe {
+            libc::sendto(self.fd, ptr::null(), 0, libc::MSG_DONTWAIT, ptr::null(), 0);
         }
     }
 

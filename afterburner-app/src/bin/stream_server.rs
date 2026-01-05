@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::panic;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[tokio::main]
 async fn main() {
@@ -28,8 +28,6 @@ async fn main() {
     let mut conn: Option<std::pin::Pin<Box<quiche::Connection>>> = None;
     let mut client_addr: Option<SocketAddr> = None;
     
-    let mut last_send = std::time::Instant::now();
-    let packet_interval = Duration::from_micros(10);
     let mut seq: u64 = 0;
     let mut total_rx_bytes: u64 = 0;
 
@@ -61,24 +59,30 @@ async fn main() {
                     c.on_timeout();
                     
                     if let Some(target) = client_addr {
-                        if c.is_established() && last_send.elapsed() >= packet_interval {
-                            let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).expect("duration_since").as_nanos() as u64;
-                            
-                            let mut payload = [0u8; 17];
-                            payload[0] = 0xA5; 
-                            payload[1..9].copy_from_slice(&now_ns.to_le_bytes());
-                            payload[9..17].copy_from_slice(&seq.to_le_bytes());
+                        if c.is_established() {
+                            // BURST: Send up to 64 packets per iteration
+                            const BATCH_LIMIT: usize = 64;
+                            let mut sent = 0;
 
-                            match c.stream_send(1, &payload, false) {
-                                Ok(_) => {
-                                    seq += 1;
-                                    last_send = std::time::Instant::now();
-                                    if seq.is_multiple_of(50_000) {
-                                        println!("[STATS] Sent: {} | RX: ~{}", seq, total_rx_bytes / 235);
-                                    }
-                                },
-                                Err(quiche::Error::Done) => {}, 
-                                Err(_) => {},
+                            while sent < BATCH_LIMIT {
+                                let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).expect("duration_since").as_nanos() as u64;
+                                
+                                let mut payload = [0u8; 17];
+                                payload[0] = 0xA5; 
+                                payload[1..9].copy_from_slice(&now_ns.to_le_bytes());
+                                payload[9..17].copy_from_slice(&seq.to_le_bytes());
+
+                                match c.stream_send(1, &payload, false) {
+                                    Ok(_) => {
+                                        seq += 1;
+                                        sent += 1;
+                                        if seq % 50_000 == 0 {
+                                            println!("[STATS] Sent: {} | RX: ~{}", seq, total_rx_bytes / 235);
+                                        }
+                                    },
+                                    Err(quiche::Error::Done) => break, // Network buffer full
+                                    Err(_) => break,
+                                }
                             }
                         }
                         
@@ -90,6 +94,7 @@ async fn main() {
                             }
                         }
                         
+                        // FLUSH: Send all queued QUIC packets in one batch
                         while let Ok((write_len, _)) = c.send(&mut out) {
                             socket.send_to(&out[..write_len], target).ok();
                         }
